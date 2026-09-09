@@ -70,7 +70,7 @@ fn get_input<T: FromStr>(hint: &str, default: T) -> T {
 }
 
 pub fn run(args: Args) {
-    let retry_seconds = 3;
+    let retry_seconds = args.retry_seconds;
     let policy = reqwest::redirect::Policy::limited(20);
     let client = Client::builder()
         .redirect(policy)
@@ -90,8 +90,15 @@ pub fn run(args: Args) {
 
         match run_once(&client, &args) {
             Ok(resp) => {
+                if !has_booking_result(&resp) {
+                    println!("Booking flow finished without a PNR. The site may have rejected the request.");
+                    println!("Retrying in {} seconds...", retry_seconds);
+                    std::thread::sleep(Duration::from_secs(retry_seconds));
+                    continue;
+                }
+
                 println!("=================================");
-                println!("BOOKING REQUEST COMPLETED");
+                println!("BOOKING SUCCESS!");
                 println!("=================================");
                 show_result(&resp);
                 break;
@@ -109,6 +116,14 @@ fn run_once(client: &Client, args: &Args) -> Result<Html, String> {
     let resp = booking_flow::run_flow(client, args)?;
     let resp = confirm_train_flow::run_flow(resp, client)?;
     confirm_ticket_flow::run_flow(&resp, client, args)
+}
+
+
+fn has_booking_result(page: &Html) -> bool {
+    Selector::parse("p.pnr-code span")
+        .ok()
+        .and_then(|selector| page.select(&selector).next())
+        .is_some()
 }
 
 pub fn parse_error(page: &Html) -> Option<String> {
@@ -676,18 +691,8 @@ fn handle_captcha_request(
         return Ok(());
     }
 
-    if first_line.starts_with(&format!("GET /captcha/{token}/image ")) {
-        let header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\nConnection: close\r\n\r\n",
-            image.len()
-        );
-        stream.write_all(header.as_bytes())?;
-        stream.write_all(image)?;
-        return Ok(());
-    }
-
     if first_line.starts_with(&format!("GET /captcha/{token}/ ")) {
-        let html = captcha_html(token);
+        let html = captcha_html(token, image);
         write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())?;
         return Ok(());
     }
@@ -707,14 +712,44 @@ fn handle_captcha_request(
         }
     }
 
-    let html = captcha_html(token);
+    let html = captcha_html(token, image);
     write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())
 }
 
-fn captcha_html(token: &str) -> String {
+fn captcha_html(token: &str, image: &[u8]) -> String {
+    // Embed the CAPTCHA directly in the HTML as a data URI. This avoids a
+    // second browser request for /image, which is especially important when
+    // the program is running behind Railway's public proxy.
+    let image_b64 = base64_encode(image);
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>THSR CAPTCHA</title></head><body style=\"font-family:sans-serif;max-width:520px;margin:40px auto;padding:20px\"><h2>台灣高鐵驗證碼</h2><p>請看圖片輸入驗證碼：</p><img src=\"/captcha/{token}/image\" alt=\"CAPTCHA\" style=\"max-width:100%;image-rendering:auto\"><form method=\"post\" action=\"/captcha/{token}/\" style=\"margin-top:20px\"><input name=\"code\" autocomplete=\"off\" autofocus style=\"font-size:24px;width:180px\"><button type=\"submit\" style=\"font-size:20px;margin-left:8px\">送出</button></form></body></html>"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>THSR CAPTCHA</title></head><body style=\"font-family:sans-serif;max-width:520px;margin:40px auto;padding:20px\"><h2>台灣高鐵驗證碼</h2><p>請看圖片輸入驗證碼：</p><img src=\"data:image/jpeg;base64,{image_b64}\" alt=\"CAPTCHA\" style=\"max-width:100%;image-rendering:auto;border:1px solid #ccc\"><form method=\"post\" action=\"/captcha/{token}/\" style=\"margin-top:20px\"><input name=\"code\" autocomplete=\"off\" autofocus style=\"font-size:24px;width:180px\"><button type=\"submit\" style=\"font-size:20px;margin-left:8px\">送出</button></form></body></html>"
     )
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().saturating_add(2) / 3 * 4);
+
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[((b0 & 0b0000_0011) << 4 | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((b1 & 0b0000_1111) << 2 | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+
+    out
 }
 
 fn form_value(body: &str, key: &str) -> String {

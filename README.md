@@ -22,7 +22,7 @@ Based on `BreezeWhite/thsr-ticket-rs`, modified for a headless Railway/container
 - `THSR_FROM=2` (Taipei)
 - `THSR_TO=12` (Zuoying)
 - `THSR_DATE=2026/09/20`
-- `THSR_TIME=27` (18:00; use `--list-time-table` to confirm)
+- `THSR_TIME=27` (18:00; the list is 1-based; use `--list-time-table` to confirm)
 - `THSR_ADULT_CNT=1`
 - `THSR_PERSONAL_ID=YOUR_ID`
 - `THSR_RETRY_SECONDS=3`
@@ -36,7 +36,7 @@ When a CAPTCHA is needed, the log will print a URL like:
 
 `https://YOUR-SERVICE.up.railway.app/captcha/<token>/`
 
-Open that URL, enter the CAPTCHA, and press **送出**. The Rust process then continues the booking flow.
+Open that URL, enter the CAPTCHA, and press **送出**. The CAPTCHA image is embedded directly in the page, so the browser does not need a separate `/image` request. The Rust process then continues the booking flow.
 
 If Railway has no public domain, the program will no longer print a misleading `127.0.0.1` URL. It will explicitly tell you to generate a domain or set `THSR_PUBLIC_URL`.
 

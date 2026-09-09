@@ -16,9 +16,9 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-fn send_telegram_message(message: &str) {
+fn telegram_notify(message: &str) {
     let token = match std::env::var("TELEGRAM_BOT_TOKEN") {
-        Ok(value) if !value.trim().is_empty() => value,
+        Ok(v) if !v.trim().is_empty() => v,
         _ => {
             println!("Telegram notification skipped: TELEGRAM_BOT_TOKEN is not set.");
             return;
@@ -26,26 +26,35 @@ fn send_telegram_message(message: &str) {
     };
 
     let chat_id = match std::env::var("TELEGRAM_CHAT_ID") {
-        Ok(value) if !value.trim().is_empty() => value,
+        Ok(v) if !v.trim().is_empty() => v,
         _ => {
             println!("Telegram notification skipped: TELEGRAM_CHAT_ID is not set.");
             return;
         }
     };
 
-    let api_url = format!("https://api.telegram.org/bot{}/sendMessage", token.trim());
-    let payload = serde_json::json!({
-        "chat_id": chat_id.trim(),
-        "text": message,
-        "disable_web_page_preview": false
-    });
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", token.trim());
+    let body = serde_urlencoded::to_string([
+        ("chat_id", chat_id.trim()),
+        ("text", message),
+    ])
+    .unwrap_or_else(|_| format!("chat_id={}&text={}", chat_id.trim(), message));
 
-    match Client::new().post(&api_url).json(&payload).send() {
-        Ok(response) if response.status().is_success() => {
+    let result = Client::new()
+        .post(url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .timeout(Duration::from_secs(15))
+        .send();
+
+    match result {
+        Ok(resp) if resp.status().is_success() => {
             println!("Telegram notification sent.");
         }
-        Ok(response) => {
-            println!("Telegram notification failed: HTTP {}", response.status());
+        Ok(resp) => {
+            let status = resp.status();
+            let detail = resp.text().unwrap_or_default();
+            println!("Telegram notification failed: HTTP {} {}", status, detail);
         }
         Err(err) => {
             println!("Telegram notification failed: {}", err);
@@ -679,8 +688,10 @@ fn wait_for_captcha(img_data: &[u8]) -> String {
     println!("Enter the CAPTCHA and press Submit.");
     println!("=================================");
 
-    send_telegram_message(&format!(
-        "🚨 THSR CAPTCHA 需要輸入\n\n請開啟以下網址輸入驗證碼：\n{}\n\n完成後按「送出」，程式會繼續訂票。",
+    // Send the CAPTCHA URL to Telegram immediately so the user can open it
+    // from a phone without watching Railway logs.
+    telegram_notify(&format!(
+        "🚄 THSR CAPTCHA REQUIRED\n\n請開啟以下網址輸入驗證碼：\n{}\n\n完成後按送出，程式會繼續搶票。",
         captcha_url
     ));
 
@@ -1279,8 +1290,8 @@ fn show_result(page: &Html) {
     println!("\nPlease use the following PNR code for payment and picking up the ticket:");
     println!("PNR Code: {}", pnr_code);
 
-    send_telegram_message(&format!(
-        "🎫 THSR 訂票成功\n\nPNR Code: {}\n\n請盡快完成付款。",
+    telegram_notify(&format!(
+        "🎉 THSR 訂票成功！\n\nPNR Code: {}\n\n請盡快完成付款。",
         pnr_code.trim()
     ));
 

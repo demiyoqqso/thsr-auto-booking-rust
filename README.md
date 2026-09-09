@@ -55,3 +55,14 @@ cargo build --release
 ## Important
 
 The CAPTCHA remains a manual step. This project does not attempt to bypass or automatically solve the site's CAPTCHA.
+## Telegram 通知（V10）
+
+此版本會在產生 CAPTCHA 網址時傳送 Telegram 訊息，訂票成功取得 PNR Code 時再傳送一則成功通知。
+
+Railway Variables：
+
+- `TELEGRAM_BOT_TOKEN`：BotFather 取得的 Bot Token
+- `TELEGRAM_CHAT_ID`：要接收通知的 Telegram 群組 Chat ID
+
+注意：只設定 `TELEGRAM_BOT_TOKEN` 還不夠，Telegram Bot API 也需要知道訊息要送到哪個 chat，因此必須另外設定 `TELEGRAM_CHAT_ID`。Bot 必須已加入目標群組。
+

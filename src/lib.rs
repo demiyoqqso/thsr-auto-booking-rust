@@ -16,6 +16,43 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+fn send_telegram_message(message: &str) {
+    let token = match std::env::var("TELEGRAM_BOT_TOKEN") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            println!("Telegram notification skipped: TELEGRAM_BOT_TOKEN is not set.");
+            return;
+        }
+    };
+
+    let chat_id = match std::env::var("TELEGRAM_CHAT_ID") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            println!("Telegram notification skipped: TELEGRAM_CHAT_ID is not set.");
+            return;
+        }
+    };
+
+    let api_url = format!("https://api.telegram.org/bot{}/sendMessage", token.trim());
+    let payload = serde_json::json!({
+        "chat_id": chat_id.trim(),
+        "text": message,
+        "disable_web_page_preview": false
+    });
+
+    match Client::new().post(&api_url).json(&payload).send() {
+        Ok(response) if response.status().is_success() => {
+            println!("Telegram notification sent.");
+        }
+        Ok(response) => {
+            println!("Telegram notification failed: HTTP {}", response.status());
+        }
+        Err(err) => {
+            println!("Telegram notification failed: {}", err);
+        }
+    }
+}
+
 use crate::cli::Args;
 use crate::schema::{STATION_MAP, TIME_TABLE, TicketType};
 
@@ -594,13 +631,22 @@ fn wait_for_captcha(img_data: &[u8]) -> String {
         }
     });
 
+    // On Railway the browser is NOT inside this container, so we must give
+    // the user a public URL. Prefer an explicit URL, then Railway's generated
+    // public domain.
+    // Public URL for the SAME Railway service. No separate captcha service is
+    // required. THSR_PUBLIC_URL is preferred; Railway's generated public
+    // domain is used automatically when available.
     let public_url = std::env::var("THSR_PUBLIC_URL")
         .or_else(|_| std::env::var("RAILWAY_PUBLIC_DOMAIN"))
-        .map(|domain| {
-            if domain.starts_with("http://") || domain.starts_with("https://") {
-                domain
+        .or_else(|_| std::env::var("RAILWAY_STATIC_URL"))
+        .ok()
+        .map(|value| {
+            let value = value.trim().trim_end_matches('/');
+            if value.starts_with("http://") || value.starts_with("https://") {
+                value.to_string()
             } else {
-                format!("https://{domain}")
+                format!("https://{value}")
             }
         });
 
@@ -608,24 +654,18 @@ fn wait_for_captcha(img_data: &[u8]) -> String {
         || std::env::var_os("RAILWAY_PROJECT_ID").is_some();
 
     let captcha_url = match public_url {
-        Some(base) => format!("{}/captcha/{}/", base.trim_end_matches('/'), token),
+        Some(ref base) => format!("{}/captcha/{}/", base.trim_end_matches('/'), token),
         None if is_railway => {
             println!();
             println!("=================================");
             println!("CAPTCHA URL NOT AVAILABLE");
             println!("=================================");
-            println!("Railway is running the CAPTCHA server, but this service has no public domain.");
-            println!("In Railway: Settings -> Networking -> Public Networking -> Generate Domain.");
-            println!("Then redeploy and try again.");
-            println!("You can also set THSR_PUBLIC_URL to your https://... service URL.");
+            println!("The CAPTCHA server is running on Railway, but this service has no public URL.");
+            println!("1. Railway -> Service -> Settings -> Networking -> Generate Domain");
+            println!("2. Redeploy the service");
+            println!("3. Or set THSR_PUBLIC_URL=https://YOUR-DOMAIN in Railway Variables");
             println!("=================================");
-
-            let (lock, cvar) = &*state;
-            let mut code = lock.lock().expect("captcha state poisoned");
-            while code.is_none() {
-                code = cvar.wait(code).expect("captcha state poisoned");
-            }
-            return code.take().unwrap_or_default();
+            return String::new();
         }
         None => format!("http://127.0.0.1:{}/captcha/{}/", addr.port(), token),
     };
@@ -638,6 +678,11 @@ fn wait_for_captcha(img_data: &[u8]) -> String {
     println!("{captcha_url}");
     println!("Enter the CAPTCHA and press Submit.");
     println!("=================================");
+
+    send_telegram_message(&format!(
+        "🚨 THSR CAPTCHA 需要輸入\n\n請開啟以下網址輸入驗證碼：\n{}\n\n完成後按「送出」，程式會繼續訂票。",
+        captcha_url
+    ));
 
     // When running directly on a desktop, also try to open the URL for the
     // user. This is deliberately skipped on Railway/headless environments.
@@ -678,44 +723,60 @@ fn handle_captcha_request(
     image: &[u8],
     state: &Arc<(Mutex<Option<String>>, Condvar)>,
 ) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    // Railway's HTTP proxy can deliver the request headers and POST body in
+    // separate TCP packets. A single read() is therefore not reliable for
+    // form submissions. Read the complete headers first, then Content-Length.
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
 
-    let mut buffer = [0u8; 16384];
-    let n = stream.read(&mut buffer)?;
-    let request = String::from_utf8_lossy(&buffer[..n]);
-    let first_line = request.lines().next().unwrap_or_default();
+    let mut buffer = Vec::<u8>::with_capacity(8192);
+    let mut chunk = [0u8; 4096];
 
-    if first_line == "GET / HTTP/1.1" || first_line == "GET / HTTP/1.0" {
-        let html = "<html><body><h3>THSR Auto Booking is running.</h3></body></html>";
-        write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())?;
-        return Ok(());
-    }
+    loop {
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..n]);
 
-    if first_line.starts_with(&format!("GET /captcha/{token}/ ")) {
-        let html = captcha_html(token, image);
-        write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())?;
-        return Ok(());
-    }
+        if buffer.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
 
-    if first_line.starts_with("POST ") {
-        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
-        let code = form_value(body, "code");
-        if !code.is_empty() {
-            let (lock, cvar) = &**state;
-            if let Ok(mut value) = lock.lock() {
-                *value = Some(code);
-                cvar.notify_one();
-            }
-            let html = "<html><body><h2>CAPTCHA received.</h2><p>訂票程式已收到驗證碼，可以關閉此分頁。</p></body></html>";
-            write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())?;
+        if buffer.len() > 64 * 1024 {
             return Ok(());
         }
     }
 
-    let html = captcha_html(token, image);
-    write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())
-}
+    let header_end = match buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(pos) => pos + 4,
+        None => return Ok(()),
+    };
 
+let (first_line, content_length) = {
+    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+
+    let first_line = headers
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
+    (first_line, content_length)
+};
+
+while buffer.len() < header_end.saturating_add(content_length) {
 fn captcha_html(token: &str, image: &[u8]) -> String {
     // Embed the CAPTCHA directly in the HTML as a data URI. This avoids a
     // second browser request for /image, which is especially important when
@@ -1217,6 +1278,11 @@ fn show_result(page: &Html) {
 
     println!("\nPlease use the following PNR code for payment and picking up the ticket:");
     println!("PNR Code: {}", pnr_code);
+
+    send_telegram_message(&format!(
+        "🎫 THSR 訂票成功\n\nPNR Code: {}\n\n請盡快完成付款。",
+        pnr_code.trim()
+    ));
 
     // Price
     let price_selector = Selector::parse("#setTrainTotalPriceValue").unwrap();

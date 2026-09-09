@@ -530,7 +530,8 @@ pub mod booking_flow {
     }
 
 fn wait_for_captcha(img_data: &[u8]) -> String {
-    fs::write("tmp_code.jpg", img_data).expect("Failed to write captcha image");
+    fs::write("tmp_code.jpg", img_data)
+        .expect("Failed to write captcha image");
 
     let token = format!(
         "{}-{}",
@@ -542,10 +543,17 @@ fn wait_for_captcha(img_data: &[u8]) -> String {
     );
 
     let state = Arc::new((Mutex::new(None::<String>), Condvar::new()));
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", std::env::var("PORT").unwrap_or_else(|_| "0".into())))
+
+    // Railway provides the listening port through PORT. Locally we use an
+    // ephemeral port so multiple copies can run without conflicts.
+    let port = std::env::var("PORT").unwrap_or_else(|_| "0".to_string());
+    let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
         .or_else(|_| TcpListener::bind("127.0.0.1:0"))
-        .expect("Failed to start captcha web server");
-    let addr = listener.local_addr().expect("Failed to read server address");
+        .expect("Failed to start CAPTCHA web server");
+    let addr = listener
+        .local_addr()
+        .expect("Failed to read CAPTCHA server address");
+
     let state_for_thread = Arc::clone(&state);
     let image = img_data.to_vec();
     let token_for_thread = token.clone();
@@ -553,32 +561,74 @@ fn wait_for_captcha(img_data: &[u8]) -> String {
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
-            let _ = handle_captcha_request(&mut stream, &token_for_thread, &image, &state_for_thread);
-            if state_for_thread.0.lock().map(|g| g.is_some()).unwrap_or(true) {
+            let _ = handle_captcha_request(
+                &mut stream,
+                &token_for_thread,
+                &image,
+                &state_for_thread,
+            );
+
+            if state_for_thread
+                .0
+                .lock()
+                .map(|g| g.is_some())
+                .unwrap_or(true)
+            {
                 break;
             }
         }
     });
 
-    let base_url = std::env::var("RAILWAY_PUBLIC_DOMAIN")
-        .or_else(|_| std::env::var("RAILWAY_STATIC_URL"))
+    let public_url = std::env::var("THSR_PUBLIC_URL")
+        .or_else(|_| std::env::var("RAILWAY_PUBLIC_DOMAIN"))
         .map(|domain| {
             if domain.starts_with("http://") || domain.starts_with("https://") {
                 domain
             } else {
-                format!("https://{}", domain)
+                format!("https://{domain}")
             }
-        })
-        .unwrap_or_else(|_| format!("http://127.0.0.1:{}", addr.port()));
+        });
+
+    let is_railway = std::env::var_os("RAILWAY_ENVIRONMENT_NAME").is_some()
+        || std::env::var_os("RAILWAY_PROJECT_ID").is_some();
+
+    let captcha_url = match public_url {
+        Some(base) => format!("{}/captcha/{}/", base.trim_end_matches('/'), token),
+        None if is_railway => {
+            println!();
+            println!("=================================");
+            println!("CAPTCHA URL NOT AVAILABLE");
+            println!("=================================");
+            println!("Railway is running the CAPTCHA server, but this service has no public domain.");
+            println!("In Railway: Settings -> Networking -> Public Networking -> Generate Domain.");
+            println!("Then redeploy and try again.");
+            println!("You can also set THSR_PUBLIC_URL to your https://... service URL.");
+            println!("=================================");
+
+            let (lock, cvar) = &*state;
+            let mut code = lock.lock().expect("captcha state poisoned");
+            while code.is_none() {
+                code = cvar.wait(code).expect("captcha state poisoned");
+            }
+            return code.take().unwrap_or_default();
+        }
+        None => format!("http://127.0.0.1:{}/captcha/{}/", addr.port(), token),
+    };
 
     println!();
     println!("=================================");
     println!("CAPTCHA REQUIRED");
     println!("=================================");
     println!("Open this URL in your browser:");
-    println!("{}/captcha/{}/", base_url.trim_end_matches('/'), token);
+    println!("{captcha_url}");
     println!("Enter the CAPTCHA and press Submit.");
     println!("=================================");
+
+    // When running directly on a desktop, also try to open the URL for the
+    // user. This is deliberately skipped on Railway/headless environments.
+    if !is_railway && public_url.is_none() {
+        open_in_browser(&captcha_url);
+    }
 
     let (lock, cvar) = &*state;
     let mut code = lock.lock().expect("captcha state poisoned");
@@ -588,20 +638,47 @@ fn wait_for_captcha(img_data: &[u8]) -> String {
     code.take().unwrap_or_default()
 }
 
+fn open_in_browser(url: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
 fn handle_captcha_request(
     stream: &mut TcpStream,
     token: &str,
     image: &[u8],
     state: &Arc<(Mutex<Option<String>>, Condvar)>,
 ) -> std::io::Result<()> {
-    let mut buffer = [0u8; 8192];
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+
+    let mut buffer = [0u8; 16384];
     let n = stream.read(&mut buffer)?;
     let request = String::from_utf8_lossy(&buffer[..n]);
     let first_line = request.lines().next().unwrap_or_default();
 
-    if first_line.starts_with(&format!("GET /captcha/{}/image ", token)) {
+    if first_line == "GET / HTTP/1.1" || first_line == "GET / HTTP/1.0" {
+        let html = "<html><body><h3>THSR Auto Booking is running.</h3></body></html>";
+        write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())?;
+        return Ok(());
+    }
+
+    if first_line.starts_with(&format!("GET /captcha/{token}/image ")) {
         let header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\nConnection: close\r\n\r\n",
             image.len()
         );
         stream.write_all(header.as_bytes())?;
@@ -609,13 +686,7 @@ fn handle_captcha_request(
         return Ok(());
     }
 
-    if first_line.starts_with(&format!("GET /captcha/{}/ ", token)) {
-        let html = captcha_html(token);
-        write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())?;
-        return Ok(());
-    }
-
-    if first_line.starts_with(&format!("GET /captcha?token={} ", token)) {
+    if first_line.starts_with(&format!("GET /captcha/{token}/ ")) {
         let html = captcha_html(token);
         write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())?;
         return Ok(());
@@ -630,7 +701,7 @@ fn handle_captcha_request(
                 *value = Some(code);
                 cvar.notify_one();
             }
-            let html = "<html><body><h2>CAPTCHA received.</h2><p>You can close this tab.</p></body></html>";
+            let html = "<html><body><h2>CAPTCHA received.</h2><p>訂票程式已收到驗證碼，可以關閉此分頁。</p></body></html>";
             write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())?;
             return Ok(());
         }
@@ -642,8 +713,7 @@ fn handle_captcha_request(
 
 fn captcha_html(token: &str) -> String {
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>THSR CAPTCHA</title></head><body style=\"font-family:sans-serif;max-width:520px;margin:40px auto;padding:20px\"><h2>台灣高鐵驗證碼</h2><p>請看圖片輸入驗證碼：</p><img src=\"/captcha/{}/image\" style=\"max-width:100%;image-rendering:auto\"><form method=\"post\" action=\"/captcha/{}/\" style=\"margin-top:20px\"><input name=\"code\" autocomplete=\"off\" autofocus style=\"font-size:24px;width:180px\"><button type=\"submit\" style=\"font-size:20px;margin-left:8px\">送出</button></form></body></html>",
-        token, token
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>THSR CAPTCHA</title></head><body style=\"font-family:sans-serif;max-width:520px;margin:40px auto;padding:20px\"><h2>台灣高鐵驗證碼</h2><p>請看圖片輸入驗證碼：</p><img src=\"/captcha/{token}/image\" alt=\"CAPTCHA\" style=\"max-width:100%;image-rendering:auto\"><form method=\"post\" action=\"/captcha/{token}/\" style=\"margin-top:20px\"><input name=\"code\" autocomplete=\"off\" autofocus style=\"font-size:24px;width:180px\"><button type=\"submit\" style=\"font-size:20px;margin-left:8px\">送出</button></form></body></html>"
     )
 }
 
@@ -664,27 +734,41 @@ fn url_decode(value: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'+' => { out.push(b' '); i += 1; }
-            b'%' if i + 2 < bytes.len() => {
-                if let Ok(v) = u8::from_str_radix(&value[i+1..i+3], 16) {
-                    out.push(v); i += 3;
-                } else { out.push(bytes[i]); i += 1; }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
             }
-            b => { out.push(b); i += 1; }
+            b'%' if i + 2 < bytes.len() => {
+                if let Ok(v) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
+                    out.push(v);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
         }
     }
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn write_http(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) -> std::io::Result<()> {
+fn write_http(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
     let header = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        status, content_type, body.len()
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        body.len()
     );
     stream.write_all(header.as_bytes())?;
     stream.write_all(body)
 }
-
 }
 
 // Second page: Confirm Train Flow

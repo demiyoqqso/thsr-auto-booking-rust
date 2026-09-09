@@ -117,6 +117,10 @@ fn get_input<T: FromStr>(hint: &str, default: T) -> T {
 
 pub fn run(args: Args) {
     let retry_seconds = args.retry_seconds;
+
+    // Send one startup message so Telegram configuration can be verified
+    // immediately instead of waiting for a CAPTCHA or successful booking.
+    telegram_notify("🚄 THSR AUTO BOOKING 已啟動");
     let policy = reqwest::redirect::Policy::limited(20);
     let client = Client::builder()
         .redirect(policy)
@@ -734,9 +738,8 @@ fn handle_captcha_request(
     image: &[u8],
     state: &Arc<(Mutex<Option<String>>, Condvar)>,
 ) -> std::io::Result<()> {
-    // Railway's HTTP proxy can deliver the request headers and POST body in
-    // separate TCP packets. A single read() is therefore not reliable for
-    // form submissions. Read the complete headers first, then Content-Length.
+    // Railway's HTTP proxy can deliver request headers and POST data in
+    // separate TCP packets, so read the complete headers first.
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
 
     let mut buffer = Vec::<u8>::with_capacity(8192);
@@ -748,11 +751,9 @@ fn handle_captcha_request(
             break;
         }
         buffer.extend_from_slice(&chunk[..n]);
-
         if buffer.windows(4).any(|w| w == b"\r\n\r\n") {
             break;
         }
-
         if buffer.len() > 64 * 1024 {
             return Ok(());
         }
@@ -763,31 +764,95 @@ fn handle_captcha_request(
         None => return Ok(()),
     };
 
-let (first_line, content_length) = {
-    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+    let (first_line, content_length) = {
+        let headers = String::from_utf8_lossy(&buffer[..header_end]);
+        let first_line = headers.lines().next().unwrap_or_default().to_string();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        (first_line, content_length)
+    };
 
-    let first_line = headers
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .to_string();
+    while buffer.len() < header_end.saturating_add(content_length) {
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..n]);
+        if buffer.len() > 2 * 1024 * 1024 {
+            return Ok(());
+        }
+    }
 
-    let content_length = headers
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            if name.eq_ignore_ascii_case("content-length") {
-                value.trim().parse::<usize>().ok()
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
+    let request_path = first_line.split_whitespace().nth(1).unwrap_or("/");
+    let expected_path = format!("/captcha/{token}/");
 
-    (first_line, content_length)
-};
+    if request_path != expected_path {
+        return write_http(
+            stream,
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            b"Not Found",
+        );
+    }
 
-while buffer.len() < header_end.saturating_add(content_length) {
+    if first_line.starts_with("GET ") {
+        let html = captcha_html(token, image);
+        return write_http(
+            stream,
+            "200 OK",
+            "text/html; charset=utf-8",
+            html.as_bytes(),
+        );
+    }
+
+    if first_line.starts_with("POST ") {
+        let body_end = header_end.saturating_add(content_length).min(buffer.len());
+        let body = String::from_utf8_lossy(&buffer[header_end..body_end]);
+        let code = form_value(&body, "code").trim().to_string();
+
+        if code.is_empty() {
+            let html = captcha_html(token, image);
+            return write_http(
+                stream,
+                "400 Bad Request",
+                "text/html; charset=utf-8",
+                html.as_bytes(),
+            );
+        }
+
+        {
+            let (lock, cvar) = &**state;
+            let mut guard = lock.lock().expect("captcha state poisoned");
+            *guard = Some(code);
+            cvar.notify_one();
+        }
+
+        let html = "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>THSR CAPTCHA</title></head><body style=\"font-family:sans-serif;max-width:520px;margin:40px auto;padding:20px\"><h2>驗證碼已送出</h2><p>請回到 Railway 查看搶票結果；程式會繼續執行。</p></body></html>";
+        return write_http(
+            stream,
+            "200 OK",
+            "text/html; charset=utf-8",
+            html.as_bytes(),
+        );
+    }
+
+    write_http(
+        stream,
+        "405 Method Not Allowed",
+        "text/plain; charset=utf-8",
+        b"Method Not Allowed",
+    )
+}
+
 fn captcha_html(token: &str, image: &[u8]) -> String {
     // Embed the CAPTCHA directly in the HTML as a data URI. This avoids a
     // second browser request for /image, which is especially important when
@@ -995,6 +1060,17 @@ pub mod confirm_train_flow {
         }
     }
 
+    fn departure_minutes(value: &str) -> Option<u16> {
+        let (h, m) = value.trim().split_once(':')?;
+        let hour = h.parse::<u16>().ok()?;
+        let minute = m.parse::<u16>().ok()?;
+        if hour <= 23 && minute <= 59 {
+            Some(hour * 60 + minute)
+        } else {
+            None
+        }
+    }
+
     impl ConfirmTrainPayload {
 pub fn select_available_trains(&mut self, trains: &[Train]) -> Result<(), String> {
     if trains.is_empty() {
@@ -1016,9 +1092,20 @@ pub fn select_available_trains(&mut self, trains: &[Train]) -> Result<(), String
         );
     }
 
-    // 自動選第一班有票車次。
-    // 高鐵查詢結果通常已依發車時間排序，因此第一筆就是最早可搭班次。
-    let selected = &trains[0];
+    // 自動選擇 12:00（含）以前的第一班有票車次。
+    // 查詢結果通常已依發車時間排序，因此符合條件的第一筆
+    // 就是最早可搭班次。
+    let selected = trains
+        .iter()
+        .find(|train| departure_minutes(&train.depart).map(|m| m <= 12 * 60).unwrap_or(false));
+
+    let selected = match selected {
+        Some(train) => train,
+        None => {
+            println!("No available trains before or at 12:00.");
+            return Err("NO_TRAIN_BEFORE_NOON".to_string());
+        }
+    };
     println!(
         "AUTO SELECT: Train {} {} -> {}",
         selected.id, selected.depart, selected.arrive

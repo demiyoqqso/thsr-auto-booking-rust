@@ -116,11 +116,32 @@ fn get_input<T: FromStr>(hint: &str, default: T) -> T {
 }
 
 pub fn run(args: Args) {
-    let retry_seconds = args.retry_seconds;
+    // ===== FIXED BOOKING SETTINGS =====
+    // These values intentionally override CLI/env booking options so the
+    // Railway deployment cannot accidentally revert to an old time setting.
+    // Departure window: 07:30 through 12:00 (NOON), inclusive.
+    let fixed_args = Args {
+        personal_id: args.personal_id.or_else(|| std::env::var("THSR_PERSONAL_ID").ok()),
+        date: Some("2026/09/25".to_string()),
+        time: Some(6), // TIME_TABLE ID 6 = 07:30
+        from: Some(3), // Banqiao
+        to: Some(7),   // Taichung
+        adult_cnt: Some(2),
+        student_cnt: Some(0),
+        seat_prefer: Some(0), // any seat
+        class_type: Some(0),  // standard class
+        use_membership: Some(false),
+        retry_seconds: 3,
+        list_station: false,
+        list_time_table: false,
+    };
+    let retry_seconds = 3;
+
+    println!("FIXED SETTINGS: Banqiao -> Taichung | date 2026/09/25 | departure 07:30-12:00 NOON | adults 2 | students 0 | seat any | class standard | membership off | retry 3s");
 
     // Send one startup message so Telegram configuration can be verified
     // immediately instead of waiting for a CAPTCHA or successful booking.
-    telegram_notify("🚄 THSR AUTO BOOKING 已啟動");
+    telegram_notify("🚄 THSR AUTO BOOKING 已啟動\n固定條件：板橋→台中｜2026/09/25｜07:30～12:00（中午12點）｜成人2｜不限座位｜標準車廂｜會員關閉");
     let policy = reqwest::redirect::Policy::limited(20);
     let client = Client::builder()
         .redirect(policy)
@@ -138,7 +159,7 @@ pub fn run(args: Args) {
         println!("THSR AUTO BOOKING - ATTEMPT {}", attempt);
         println!("=================================");
 
-        match run_once(&client, &args) {
+        match run_once(&client, &fixed_args) {
             Ok(resp) => {
                 if !has_booking_result(&resp) {
                     println!("Booking flow finished without a PNR. The site may have rejected the request.");
@@ -694,6 +715,7 @@ fn wait_for_captcha(img_data: &[u8]) -> String {
 
     // Send the CAPTCHA URL to Telegram immediately so the user can open it
     // from a phone without watching Railway logs.
+    println!("TELEGRAM: sending CAPTCHA URL...");
     telegram_notify(&format!(
         "🚄 THSR CAPTCHA REQUIRED\n\n請開啟以下網址輸入驗證碼：\n{}\n\n完成後按送出，程式會繼續搶票。",
         captcha_url
@@ -1092,18 +1114,24 @@ pub fn select_available_trains(&mut self, trains: &[Train]) -> Result<(), String
         );
     }
 
-    // 自動選擇 12:00（含）以前的第一班有票車次。
-    // 查詢結果通常已依發車時間排序，因此符合條件的第一筆
-    // 就是最早可搭班次。
-    let selected = trains
-        .iter()
-        .find(|train| departure_minutes(&train.depart).map(|m| m <= 12 * 60).unwrap_or(false));
+    // HARD STOP: only accept departures from 07:30 through 12:00 (NOON).
+    // Never select a train after noon, even if the THSR response contains one.
+    // The lower bound also prevents an accidental selection of overnight/early
+    // morning trains if the server returns a wider result set.
+    const MIN_DEPARTURE_MINUTES: u16 = 7 * 60 + 30;
+    const MAX_DEPARTURE_MINUTES: u16 = 12 * 60;
+
+    let selected = trains.iter().find(|train| {
+        departure_minutes(&train.depart)
+            .map(|m| m >= MIN_DEPARTURE_MINUTES && m <= MAX_DEPARTURE_MINUTES)
+            .unwrap_or(false)
+    });
 
     let selected = match selected {
         Some(train) => train,
         None => {
-            println!("No available trains before or at 12:00.");
-            return Err("NO_TRAIN_BEFORE_NOON".to_string());
+            println!("No available trains in the fixed 07:30-12:00 NOON window.");
+            return Err("NO_TRAIN_IN_FIXED_TIME_WINDOW".to_string());
         }
     };
     println!(

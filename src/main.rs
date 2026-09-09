@@ -1,5 +1,4 @@
 use clap::Parser;
-
 use thsr::cli::Args;
 use thsr::run;
 use thsr::schema::{STATION_MAP, TIME_TABLE};
@@ -35,7 +34,6 @@ fn main() {
         show_time_table();
         return;
     }
-
     if args.list_station {
         show_station();
         return;

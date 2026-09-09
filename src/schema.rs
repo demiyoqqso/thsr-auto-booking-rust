@@ -1,6 +1,6 @@
 pub static STATION_MAP: [&str; 12] = [
     "Nangang", "Taipei", "Banqiao", "Taoyuan", "Hsinchu", "Miaoli", "Taichung", "Changhua",
-    "Yunlin", "Chiayi", "Tainan", "Zuouing",
+    "Yunlin", "Chiayi", "Tainan", "Zuoying",
 ];
 
 pub static TIME_TABLE: [&str; 38] = [
@@ -13,9 +13,9 @@ pub static TIME_TABLE: [&str; 38] = [
 #[repr(u8)]
 #[derive(Debug, Clone)]
 pub enum TicketType {
-    Adult = 70,    // F
-    Child = 72,    // H
-    Disabled = 87, // W
-    Elder = 69,    // E
-    College = 80,  // P
+    Adult = 70,
+    Child = 72,
+    Disabled = 87,
+    Elder = 69,
+    College = 80,
 }

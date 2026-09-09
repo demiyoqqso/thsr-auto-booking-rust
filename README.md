@@ -1,96 +1,46 @@
-# THSR-Ticket Rust
+# THSR Auto Booking (Rust)
 
-A program for booking ticket of Taiwan High Speed Railway (THSR).
+Based on BreezeWhite/thsr-ticket-rs, modified for a headless Railway/container environment.
 
-This is the rust version of the original python ver [THSR-Ticket](https://github.com/BreezeWhite/THSR-Ticket), with improvements including more CLI input options, early-bird support, membership, etc.
+## What changed
 
-## Install
-### Download from the [Release](https://github.com/BreezeWhite/thsr-ticket-rs/releases) page
+- No Python required.
+- Automatically selects the first available train.
+- Automatically retries when no train is available.
+- Fixes the previous broken `run_once` flow.
+- Fixes the Linux/Railway CAPTCHA crash caused by `xdg-open`.
+- CAPTCHA is shown through a small temporary web page instead of a desktop image viewer.
+- Supports Railway environment variables for the booking parameters.
 
-Pick the one according to your OS, download the executable file, and open the terminal to execute it.
+## Important
 
-You could also put it to one of your PATH dir (e.g. ~/.local/bin for Ubuntu) to always make it accessable.
+The CAPTCHA is intentionally left for the user to enter manually. The program does not attempt to bypass or solve the site's CAPTCHA.
 
-### Install with cargo
+## Railway variables
 
-Make sure you have [cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html) installed.
+Set these variables in Railway:
 
-For older linux machines, this method is preferred, since the release is built by Github Action and the workflow only supports Ubuntu-22.04 and latter.
+- `THSR_FROM=2` (Taipei)
+- `THSR_TO=12` (Zuoying)
+- `THSR_DATE=2026/09/20`
+- `THSR_TIME=27` (18:00; use `--list-time-table` to confirm IDs)
+- `THSR_ADULT_CNT=1`
+- `THSR_PERSONAL_ID=YOUR_ID`
+- `THSR_RETRY_SECONDS=3`
+- `THSR_SEAT_PREFER=0`
+- `THSR_CLASS_TYPE=0`
+- `THSR_USE_MEMBERSHIP=false`
 
-```bash
-# Install rust toolchain
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+Railway's `PORT` is used automatically. When a CAPTCHA is needed, the log prints a URL. Open that URL in your browser, enter the CAPTCHA, and submit it. The booking flow then continues automatically.
 
-# Build and install
-cargo install --git https://github.com/BreezeWhite/thsr-ticket-rs
-```
-
-## Usage
-
-```bash
-# Use without flags.
-# This will guide you through the process for entering informations.
-thsr
-
-# Or pass values to arguments.
-# If some required informations are not specified, the program will ask you to enter.
-thsr --from 2 --to 11 --adult-cnt 2
-
-# To see available stations and its ID value
-thsr --list-station
-
-# To see available times and its ID value
-thsr --list-time-table
-
-# All following date formats are supported
-thsr --date 2025/01/01
-thsr --date 2025/1/01
-thsr --date 2025/01/1
-thsr --date 2025/1/1
-
-# Use membership. The membership ID will be the same as the personal ID.
-thsr --use-membership true
-```
-
-### Complete options
+## Local
 
 ```bash
-A CLI tool for booking Taiwan High Speed Rail tickets. Run the program without flags will guide you through the booking process
-
-Usage: thsr [OPTIONS]
-
-Options:
-  -i, --personal-id <ID>
-          Personal ID
-  -d, --date <DATE>
-          Departure date
-  -T, --time <TIME_ID>
-          Time ID of the departure time. To see available times, use the --list-time-table option
-  -f, --from <STATION_ID>
-          Departure station ID. To see available stations, use the --list-station option
-  -t, --to <STATION_ID>
-          Arrival station ID. To see available stations, use the --list-station option
-  -a, --adult-cnt <NUMBER>
-          Number of adults
-  -s, --student-cnt <NUMBER>
-          Number of students
-  -p, --seat-prefer <NUMBER>
-          Seat preference. 0: None, 1: Window, 2: Aisle [possible values: 0, 1, 2]
-  -c, --class-type <NUMBER>
-          Class type. 0: Standard, 1: Business [possible values: 0, 1]
-  -m, --use-membership <TO_USE_MEMBERSHIP>
-          Whether to use personal ID as membership [possible values: true, false]
-      --list-station
-          List available stations
-      --list-time-table
-          List available times
-  -h, --help
-          Print help
-  -V, --version
-          Print version
+cargo run -- --from 2 --to 12 --date 2026/09/20 --time 25 --adult-cnt 1 --personal-id YOUR_ID --retry-seconds 3
 ```
 
+## Build
 
-## ***DISCLAIMER***
-
-This is an unofficial implementation and is for research purpose only. Any legal liability is on your own. Use at your own risk.
+```bash
+cargo build --release
+```
